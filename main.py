@@ -9,6 +9,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 def home():
     return "👻 Horror Script Generator is running!"
 
+if __name__ == "__main__":
+    app.run(debug=True)
+
 @app.route("/generate", methods=["POST"])
 def generate_horror_script():
     data = request.json
