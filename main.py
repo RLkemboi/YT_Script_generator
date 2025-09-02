@@ -2,21 +2,21 @@ import os
 import requests
 from flask import Flask, request, jsonify
 
-# Load Hugging Face API key from environment variables
 HF_API_KEY = os.getenv("HF_API_KEY")
+print("HF_API_KEY loaded:", "✅" if HF_API_KEY else "❌")
 
-if not HF_API_KEY:
-    raise ValueError("❌ HF_API_KEY is not set in environment variables on Render.")
+if HF_API_KEY is None:
+    raise ValueError("HF_API_KEY is not set in environment variables")
 
-# Flask app
 app = Flask(__name__)
 
-# Model to use
-HF_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"  # can swap to another model
+HF_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"  # you can swap this
+
 
 @app.route("/", methods=["GET"])
 def home():
     return "👻 Horror Script Generator is running (Hugging Face)!"
+
 
 @app.route("/generate", methods=["POST"])
 def generate_horror_script():
@@ -36,30 +36,35 @@ def generate_horror_script():
             json=payload,
             timeout=60
         )
-        result = response.json()
 
-        # Debug log to check full Hugging Face response in Render logs
-        print("🔎 HF response:", result, flush=True)
+        # ✅ Log status + raw response
+        print("HF Status:", response.status_code)
+        print("HF Raw Response:", response.text[:500])  # only show first 500 chars
 
+        # Try JSON parsing safely
+        try:
+            result = response.json()
+        except Exception as parse_err:
+            return jsonify({
+                "error": f"Invalid JSON from Hugging Face",
+                "details": response.text
+            }), 500
+
+        # Handle HF API errors
         if "error" in result:
             return jsonify({"error": result["error"]}), 500
 
-        # Hugging Face responses can vary depending on the model
+        # Handle text-generation response structure
         if isinstance(result, list) and "generated_text" in result[0]:
             story = result[0]["generated_text"]
-        elif "generated_text" in result:
-            story = result["generated_text"]
         else:
             story = str(result)
 
         return jsonify({"script": story})
 
     except Exception as e:
-        print("❌ Exception:", str(e), flush=True)
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    # Important: Render binds to 0.0.0.0 and uses PORT env variable
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000, debug=True)
