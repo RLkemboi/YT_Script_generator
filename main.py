@@ -3,6 +3,7 @@ import requests
 from flask import Flask, request, jsonify
 
 HF_API_KEY = os.getenv("HF_API_KEY")
+print(HF_API_KEY)
 
 if HF_API_KEY is None:
     raise ValueError("HF_API_KEY is not set in environment variables")
