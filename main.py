@@ -57,7 +57,6 @@ def healthz():
         "status": "ok",
         "configured": bool(config.api_key),
         "model": config.model,
-        "api_base": config.api_base,
     })
 
 

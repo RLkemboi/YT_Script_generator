@@ -1,10 +1,9 @@
 import json
 
+import anthropic
 import pytest
-import requests
 
 import generator
-from conftest import FakeResponse, FakeSession, chat_response
 from generator import (
     ConfigurationError,
     InvalidRequestError,
@@ -26,6 +25,7 @@ def test_brief_defaults():
     assert brief.duration_minutes == 10
     assert brief.word_target == 1400
     assert brief.sections == 4
+    assert brief.max_tokens == int(1400 * 1.6) + 400
     assert "horror" in brief.prompt.lower()
 
 
@@ -38,6 +38,18 @@ def test_brief_accepts_overrides():
     assert brief.tone == "bleak"
 
 
+def test_brief_max_tokens_respects_ceiling(monkeypatch):
+    monkeypatch.setenv("CLAUDE_MAX_TOKENS_CEILING", "3000")
+    brief = ScriptBrief(duration_minutes=60)  # would estimate well above the ceiling
+    assert brief.max_tokens == 3000
+
+
+def test_brief_max_tokens_has_a_floor(monkeypatch):
+    monkeypatch.setenv("CLAUDE_MAX_TOKENS_CEILING", "500")  # below MIN_MAX_TOKENS
+    brief = ScriptBrief(duration_minutes=1)
+    assert brief.max_tokens == generator.MIN_MAX_TOKENS
+
+
 @pytest.mark.parametrize("kwargs", [
     {"prompt": 123},
     {"duration_minutes": 0},
@@ -45,12 +57,17 @@ def test_brief_accepts_overrides():
     {"duration_minutes": "soon"},
     {"section_count": 0},
     {"section_count": 99},
-    {"temperature": 5},
+    {"temperature": 1.5},
     {"temperature": -1},
 ])
 def test_brief_rejects_bad_input(kwargs):
     with pytest.raises(InvalidRequestError):
         ScriptBrief(**kwargs)
+
+
+def test_brief_accepts_temperature_within_anthropic_range():
+    assert ScriptBrief(temperature=1.0).temperature == 1.0
+    assert ScriptBrief(temperature=0.0).temperature == 0.0
 
 
 def test_brief_rejects_overlong_prompt(monkeypatch):
@@ -116,137 +133,109 @@ def test_parse_tolerates_missing_fields():
 
 # --- upstream call ----------------------------------------------------------
 
-def test_call_model_posts_to_chat_completions():
-    session = FakeSession([chat_response("hello")])
-    assert call_model(ScriptBrief(), session=session) == "hello"
-    call = session.calls[0]
-    assert call["url"] == "https://router.huggingface.co/v1/chat/completions"
-    assert call["headers"]["Authorization"] == "Bearer test-key"
-    assert call["json"]["messages"][0]["role"] == "system"
-    assert "YouTube horror narration script" in call["json"]["messages"][1]["content"]
-    assert call["json"]["stream"] is False
+def test_call_model_sends_expected_request(fake_client, make_chat_message):
+    client = fake_client([make_chat_message("hello")])
+    brief = ScriptBrief()
+    assert call_model(brief, client=client) == "hello"
+    call = client.calls[0]
+    assert call["model"] == "claude-haiku-4-5"
+    assert call["system"] == generator.SYSTEM_PROMPT
+    assert call["messages"] == [
+        {"role": "user", "content": generator.build_user_prompt(brief)}
+    ]
+    assert call["max_tokens"] == brief.max_tokens
+    assert call["temperature"] == 0.85
 
 
-def test_call_model_respects_env_overrides(monkeypatch):
-    monkeypatch.setenv("HF_API_BASE", "https://example.test/v1/")
-    monkeypatch.setenv("HF_MODEL", "some/model")
-    monkeypatch.setenv("HF_JSON_MODE", "true")
-    session = FakeSession([chat_response("hi")])
-    call_model(ScriptBrief(), session=session)
-    call = session.calls[0]
-    assert call["url"] == "https://example.test/v1/chat/completions"
-    assert call["json"]["model"] == "some/model"
-    assert call["json"]["response_format"] == {"type": "json_object"}
+def test_call_model_respects_model_override(monkeypatch, fake_client, make_chat_message):
+    monkeypatch.setenv("CLAUDE_MODEL", "claude-opus-5")
+    client = fake_client([make_chat_message("hi")])
+    call_model(ScriptBrief(), client=client)
+    assert client.calls[0]["model"] == "claude-opus-5"
 
 
-def test_call_model_requires_api_key(monkeypatch):
-    monkeypatch.delenv("HF_API_KEY", raising=False)
+def test_call_model_uses_brief_temperature_override(fake_client, make_chat_message):
+    client = fake_client([make_chat_message("hi")])
+    call_model(ScriptBrief(temperature=0.2), client=client)
+    assert client.calls[0]["temperature"] == 0.2
+
+
+def test_call_model_requires_api_key(monkeypatch, fake_client):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(ConfigurationError) as excinfo:
-        call_model(ScriptBrief(), session=FakeSession([]))
+        call_model(ScriptBrief(), client=fake_client([]))
     assert excinfo.value.status_code == 503
 
 
-def test_call_model_accepts_hf_token_alias(monkeypatch):
-    monkeypatch.delenv("HF_API_KEY", raising=False)
-    monkeypatch.setenv("HF_TOKEN", "alias-key")
-    session = FakeSession([chat_response("ok")])
-    call_model(ScriptBrief(), session=session)
-    assert session.calls[0]["headers"]["Authorization"] == "Bearer alias-key"
-
-
-@pytest.mark.parametrize("status", [401, 403])
-def test_call_model_reports_bad_key(status):
-    session = FakeSession([FakeResponse(status, text="invalid token")])
+@pytest.mark.parametrize("error_class,status", [
+    (anthropic.AuthenticationError, 401),
+    (anthropic.PermissionDeniedError, 403),
+])
+def test_call_model_maps_bad_key_errors(fake_client, anthropic_error, error_class, status):
+    client = fake_client([anthropic_error(error_class, status)])
     with pytest.raises(ConfigurationError):
-        call_model(ScriptBrief(), session=session)
+        call_model(ScriptBrief(), client=client)
 
 
-def test_call_model_reports_unknown_model():
-    session = FakeSession([FakeResponse(404, text="not found")])
+def test_call_model_maps_not_found_to_upstream_error(fake_client, anthropic_error):
+    client = fake_client([anthropic_error(anthropic.NotFoundError, 404)])
     with pytest.raises(UpstreamError) as excinfo:
-        call_model(ScriptBrief(), session=session)
-    assert "HF_MODEL" in excinfo.value.details
+        call_model(ScriptBrief(), client=client)
+    assert "CLAUDE_MODEL" in excinfo.value.details
 
 
-def test_call_model_retries_on_503_then_succeeds(no_sleep):
-    session = FakeSession([
-        FakeResponse(503, text="model loading"),
-        FakeResponse(503, text="model loading"),
-        chat_response("finally"),
-    ])
-    assert call_model(ScriptBrief(), session=session) == "finally"
-    assert len(session.calls) == 3
-
-
-def test_call_model_retries_network_errors(no_sleep):
-    """The old code returned on the first exception, so retries never ran."""
-    session = FakeSession([
-        requests.exceptions.ConnectionError("boom"),
-        chat_response("recovered"),
-    ])
-    assert call_model(ScriptBrief(), session=session) == "recovered"
-    assert len(session.calls) == 2
-
-
-def test_call_model_gives_up_after_max_retries(no_sleep, monkeypatch):
-    monkeypatch.setenv("HF_MAX_RETRIES", "2")
-    session = FakeSession([FakeResponse(503, text="still loading")] * 2)
+def test_call_model_maps_rate_limit(fake_client, anthropic_error):
+    client = fake_client([anthropic_error(anthropic.RateLimitError, 429)])
     with pytest.raises(UpstreamError):
-        call_model(ScriptBrief(), session=session)
-    assert len(session.calls) == 2
+        call_model(ScriptBrief(), client=client)
 
 
-def test_call_model_maps_timeout(no_sleep, monkeypatch):
-    monkeypatch.setenv("HF_MAX_RETRIES", "1")
-    session = FakeSession([requests.exceptions.Timeout("too slow")])
+def test_call_model_maps_generic_status_error(fake_client, anthropic_error):
+    client = fake_client([anthropic_error(anthropic.APIStatusError, 500)])
+    with pytest.raises(UpstreamError):
+        call_model(ScriptBrief(), client=client)
+
+
+def test_call_model_maps_timeout(fake_client, anthropic_error):
+    client = fake_client([anthropic_error(anthropic.APITimeoutError)])
     with pytest.raises(UpstreamTimeout) as excinfo:
-        call_model(ScriptBrief(), session=session)
+        call_model(ScriptBrief(), client=client)
     assert excinfo.value.status_code == 504
 
 
-def test_call_model_honours_retry_after_header(no_sleep, monkeypatch):
-    seen = []
-    monkeypatch.setattr(generator.time, "sleep", lambda s: seen.append(s))
-    session = FakeSession([
-        FakeResponse(429, text="slow down", headers={"Retry-After": "5"}),
-        chat_response("ok"),
-    ])
-    call_model(ScriptBrief(), session=session)
-    assert 5.0 <= seen[0] <= 5.5
-
-
-def test_call_model_rejects_non_json_body():
-    session = FakeSession([FakeResponse(200, json_body=None, text="<html>gateway</html>")])
-    with pytest.raises(UpstreamError) as excinfo:
-        call_model(ScriptBrief(), session=session)
-    assert "non-JSON" in excinfo.value.message
-
-
-def test_call_model_surfaces_provider_error_object():
-    session = FakeSession([FakeResponse(200, {"error": {"message": "quota exceeded"}})])
-    with pytest.raises(UpstreamError) as excinfo:
-        call_model(ScriptBrief(), session=session)
-    assert excinfo.value.details == "quota exceeded"
-
-
-def test_call_model_rejects_empty_content():
-    session = FakeSession([FakeResponse(200, {"choices": [{"message": {"content": "  "}}]})])
+def test_call_model_maps_connection_error(fake_client, anthropic_error):
+    client = fake_client([anthropic_error(anthropic.APIConnectionError)])
     with pytest.raises(UpstreamError):
-        call_model(ScriptBrief(), session=session)
+        call_model(ScriptBrief(), client=client)
 
 
-def test_call_model_handles_content_blocks():
-    session = FakeSession([FakeResponse(200, {"choices": [{"message": {"content": [
-        {"type": "text", "text": "part one "}, {"type": "text", "text": "part two"}]}}]})])
-    assert call_model(ScriptBrief(), session=session) == "part one part two"
+def test_call_model_raises_on_refusal(fake_client, make_chat_message, fake_stop_details_cls):
+    msg = make_chat_message(text=None, stop_reason="refusal",
+                            stop_details=fake_stop_details_cls(explanation="policy"))
+    client = fake_client([msg])
+    with pytest.raises(UpstreamError) as excinfo:
+        call_model(ScriptBrief(), client=client)
+    assert excinfo.value.details == "policy"
+
+
+def test_call_model_rejects_empty_content(fake_client, make_chat_message):
+    client = fake_client([make_chat_message("   ")])
+    with pytest.raises(UpstreamError):
+        call_model(ScriptBrief(), client=client)
+
+
+def test_call_model_joins_multiple_text_blocks(fake_client, fake_message_cls, make_text_block):
+    blocks = [make_text_block("part one "), make_text_block("part two")]
+    client = fake_client([fake_message_cls(content=blocks)])
+    assert call_model(ScriptBrief(), client=client) == "part one part two"
 
 
 # --- end to end -------------------------------------------------------------
 
-def test_generate_script_returns_full_payload():
-    session = FakeSession([chat_response(json.dumps(VALID_SCRIPT))])
-    result = generate_script(ScriptBrief(prompt="A house that counts"), session=session)
+def test_generate_script_returns_full_payload(fake_client, make_chat_message):
+    client = fake_client([make_chat_message(json.dumps(VALID_SCRIPT))])
+    result = generate_script(ScriptBrief(prompt="A house that counts"), client=client)
     assert result["status"] == "success"
     assert result["request"]["prompt"] == "A house that counts"
     assert result["script"]["title"] == VALID_SCRIPT["title"]
-    assert result["model"] == "Qwen/Qwen2.5-72B-Instruct"
+    assert result["model"] == "claude-haiku-4-5"

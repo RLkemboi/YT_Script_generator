@@ -1,18 +1,16 @@
 """Turns a one-line idea into a production-ready YouTube horror script.
 
-Talks to the Hugging Face Inference Providers router, which speaks the
-OpenAI chat-completions dialect. The older `api-inference.huggingface.co`
-serverless endpoint this project used to call has been retired, which is why
-requests against it never produced a script.
+Talks to Claude through the official Anthropic SDK. The SDK handles retries
+(408/409/429/5xx and connection errors) and per-request timeouts itself, so
+this module's job is building the request, mapping SDK exceptions onto HTTP
+responses, and parsing the reply.
 """
 
 import json
 import logging
-import random
 import re
-import time
 
-import requests
+import anthropic
 
 from config import config
 
@@ -21,6 +19,12 @@ log = logging.getLogger(__name__)
 # Narration pace used to turn a target runtime into a word budget.
 WORDS_PER_MINUTE = 140
 
+# Rough English tokens-per-word plus headroom for the JSON scaffolding
+# (keys, quotes, timestamps) the model has to emit around the narration.
+TOKENS_PER_WORD_ESTIMATE = 1.6
+JSON_OVERHEAD_TOKENS = 400
+MIN_MAX_TOKENS = 1024
+
 SYSTEM_PROMPT = (
     "You are a veteran horror screenwriter who writes narration for YouTube "
     "videos. You write in a calm, patient, deeply unsettling voice: concrete "
@@ -28,9 +32,6 @@ SYSTEM_PROMPT = (
     "implication rather than gore. You never break character and never "
     "explain the craft behind the story."
 )
-
-# Retried: rate limits, cold models, and transient gateway failures.
-RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 
 
 class ScriptGenerationError(Exception):
@@ -143,8 +144,10 @@ class ScriptBrief:
             temperature = float(value)
         except (TypeError, ValueError):
             raise InvalidRequestError("'temperature' must be a number.")
-        if not 0.0 <= temperature <= 2.0:
-            raise InvalidRequestError("'temperature' must be between 0.0 and 2.0.")
+        # Anthropic's temperature range is 0.0-1.0 (not the 0.0-2.0 some
+        # other providers use).
+        if not 0.0 <= temperature <= 1.0:
+            raise InvalidRequestError("'temperature' must be between 0.0 and 1.0.")
         return temperature
 
     @property
@@ -157,6 +160,12 @@ class ScriptBrief:
             return self.section_count
         # Roughly one beat every two and a half minutes, kept in a sane range.
         return max(3, min(10, round(self.duration_minutes / 2.5)))
+
+    @property
+    def max_tokens(self):
+        """Output budget sized to the requested runtime, capped for safety."""
+        estimated = int(self.word_target * TOKENS_PER_WORD_ESTIMATE) + JSON_OVERHEAD_TOKENS
+        return max(MIN_MAX_TOKENS, min(estimated, config.max_tokens_ceiling))
 
 
 def build_user_prompt(brief):
@@ -319,155 +328,79 @@ def parse_script(raw_text):
     return script
 
 
-def _build_payload(brief):
-    payload = {
-        "model": config.model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(brief)},
-        ],
-        "max_tokens": config.max_tokens,
-        "temperature": (brief.temperature if brief.temperature is not None
-                        else config.temperature),
-        "stream": False,
-    }
-    if config.json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    return payload
+def _extract_text(message):
+    """Read the assistant's text out of an Anthropic `Message.content` list."""
+    parts = [block.text for block in message.content
+             if getattr(block, "type", None) == "text" and block.text]
+    text = "".join(parts)
+    if not text.strip():
+        raise UpstreamError(
+            "Claude returned no text content.",
+            details="stop_reason=%s" % getattr(message, "stop_reason", None),
+        )
+    return text
 
 
-def _extract_message_content(body):
-    """Read the assistant text out of a chat-completions response body."""
-    if not isinstance(body, dict):
-        raise UpstreamError("Inference provider returned an unexpected response shape.")
-
-    if "error" in body:
-        error = body["error"]
-        message = error.get("message") if isinstance(error, dict) else str(error)
-        raise UpstreamError("Inference provider rejected the request.", details=message)
-
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise UpstreamError("Inference provider returned no choices.",
-                            details=json.dumps(body)[:400])
-
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-
-    # Some providers stream-shape the first choice even for non-streaming calls.
-    if content is None:
-        content = (choices[0].get("delta") or {}).get("content")
-    if content is None:
-        content = choices[0].get("text")
-
-    if isinstance(content, list):
-        # Multi-part content blocks: keep the text parts.
-        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-
-    if not isinstance(content, str) or not content.strip():
-        raise UpstreamError("Inference provider returned an empty script.",
-                            details=json.dumps(body)[:400])
-    return content
+def _client():
+    return anthropic.Anthropic(
+        api_key=config.api_key,
+        max_retries=config.max_retries,
+        timeout=config.request_timeout,
+    )
 
 
-def _sleep_for_attempt(attempt, retry_after=None):
-    if retry_after is not None:
-        delay = retry_after
-    else:
-        delay = config.retry_backoff * (2 ** attempt)
-    delay += random.uniform(0, 0.5)  # jitter, so parallel callers do not sync up
-    delay = min(delay, 30.0)
-    log.info("Retrying inference request in %.1fs (attempt %d).", delay, attempt + 1)
-    time.sleep(delay)
-
-
-def _parse_retry_after(response):
-    raw = response.headers.get("Retry-After") if response is not None else None
-    if not raw:
-        return None
-    try:
-        return max(0.0, min(float(raw), 30.0))
-    except ValueError:
-        return None
-
-
-def call_model(brief, session=None):
-    """POST the brief to the inference provider, retrying transient failures."""
-    api_key = config.api_key
-    if not api_key:
+def call_model(brief, client=None):
+    """Ask Claude for a script and return the raw text of its reply."""
+    if not config.api_key:
         raise ConfigurationError(
-            "HF_API_KEY is not set, so scripts cannot be generated.",
-            details="Set HF_API_KEY (or HF_TOKEN) to a Hugging Face access token "
-                    "with inference permissions and restart the service.",
+            "ANTHROPIC_API_KEY is not set, so scripts cannot be generated.",
+            details="Set ANTHROPIC_API_KEY to an Anthropic API key and restart the service.",
         )
 
-    url = "%s/chat/completions" % config.api_base
-    headers = {
-        "Authorization": "Bearer %s" % api_key,
-        "Content-Type": "application/json",
-    }
-    payload = _build_payload(brief)
-    http = session or requests
-    attempts = config.max_retries
-    last_error = None
+    anthropic_client = client or _client()
+    temperature = brief.temperature if brief.temperature is not None else config.temperature
 
-    for attempt in range(attempts):
-        try:
-            response = http.post(url, headers=headers, json=payload,
-                                 timeout=config.request_timeout)
-        except requests.exceptions.Timeout as exc:
-            last_error = UpstreamTimeout(
-                "The inference provider did not respond in time.", details=str(exc))
-        except requests.exceptions.RequestException as exc:
-            last_error = UpstreamError(
-                "Could not reach the inference provider.", details=str(exc))
-        else:
-            status = response.status_code
-            if status == 401 or status == 403:
-                raise ConfigurationError(
-                    "The inference provider rejected the API key.",
-                    details=response.text[:400],
-                )
-            if status == 404:
-                raise UpstreamError(
-                    "Model '%s' is not available at %s." % (config.model, config.api_base),
-                    details="Pick a model served by Hugging Face Inference Providers "
-                            "and set HF_MODEL to it.",
-                )
-            if status in RETRYABLE_STATUS:
-                last_error = UpstreamError(
-                    "Inference provider is unavailable (HTTP %d)." % status,
-                    details=response.text[:400],
-                )
-                if attempt < attempts - 1:
-                    _sleep_for_attempt(attempt, _parse_retry_after(response))
-                    continue
-                raise last_error
-            if status >= 400:
-                raise UpstreamError(
-                    "Inference provider returned HTTP %d." % status,
-                    details=response.text[:400],
-                )
+    try:
+        message = anthropic_client.messages.create(
+            model=config.model,
+            max_tokens=brief.max_tokens,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": build_user_prompt(brief)}],
+            temperature=temperature,
+        )
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+        raise ConfigurationError(
+            "Claude rejected the API key.", details=str(exc)) from exc
+    except anthropic.NotFoundError as exc:
+        raise UpstreamError(
+            "Model '%s' is not available." % config.model,
+            details="Check CLAUDE_MODEL against the models your API key can access.",
+        ) from exc
+    except anthropic.RateLimitError as exc:
+        raise UpstreamError(
+            "Claude is rate-limiting this API key.", details=str(exc)) from exc
+    except anthropic.APITimeoutError as exc:
+        raise UpstreamTimeout(
+            "Claude did not respond in time.", details=str(exc)) from exc
+    except anthropic.APIConnectionError as exc:
+        raise UpstreamError(
+            "Could not reach the Claude API.", details=str(exc)) from exc
+    except anthropic.APIStatusError as exc:
+        raise UpstreamError(
+            "Claude API returned HTTP %d." % exc.status_code, details=str(exc)) from exc
 
-            try:
-                body = response.json()
-            except ValueError:
-                raise UpstreamError(
-                    "Inference provider returned a non-JSON response.",
-                    details=response.text[:400],
-                )
-            return _extract_message_content(body)
+    if message.stop_reason == "refusal":
+        raise UpstreamError(
+            "Claude declined to generate this script.",
+            details=getattr(message.stop_details, "explanation", None),
+        )
 
-        # Network-level failure: back off and try again instead of bailing out.
-        if attempt < attempts - 1:
-            _sleep_for_attempt(attempt)
-
-    raise last_error or UpstreamError("The inference provider could not be reached.")
+    return _extract_text(message)
 
 
-def generate_script(brief, session=None):
+def generate_script(brief, client=None):
     """Generate a script for `brief` and return the response payload."""
-    raw_text = call_model(brief, session=session)
+    raw_text = call_model(brief, client=client)
     script = parse_script(raw_text)
     return {
         "status": "success",
