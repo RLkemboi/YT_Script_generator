@@ -1,109 +1,114 @@
+"""HTTP entry point for the YouTube horror script generator.
+
+`main:app` is the WSGI callable referenced by the Procfile.
+"""
+
+import logging
 import os
-import time
-import requests
-from flask import Flask, request, jsonify
 
-# --- Load Hugging Face API Key ---
-HF_API_KEY = os.getenv("HF_API_KEY")
-print("HF_API_KEY loaded:", "✅" if HF_API_KEY else "❌")
+from flask import Flask, jsonify, request
 
-if HF_API_KEY is None:
-    raise ValueError("HF_API_KEY is not set in environment variables")
+try:  # Load a local .env during development; absent in production images.
+    from dotenv import load_dotenv
 
-# --- Flask app setup ---
+    load_dotenv()
+except ImportError:  # pragma: no cover - dotenv is a convenience, not a requirement
+    pass
+
+from config import config
+from generator import (
+    InvalidRequestError,
+    ScriptBrief,
+    ScriptGenerationError,
+    generate_script,
+)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("yt_script_generator")
+
 app = Flask(__name__)
 
-# Hugging Face model (can swap later)
-HF_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-
-@app.route("/", methods=["GET"])
+@app.get("/")
 def home():
-    return "👻 Horror Script Generator is running (Hugging Face)!"
-
-
-@app.route("/generate", methods=["POST"])
-def generate_horror_script():
-    # --- 1. Read user input safely ---
-    data = request.get_json(force=True, silent=True) or {}
-    user_prompt = data.get("prompt", "Write a creepy horror story.")
-
-    # --- 2. Format input for Mixtral-Instruct ---
-    # MUST follow the <s>[INST] ... [/INST] format
-    formatted_prompt = f"<s>[INST] You are an expert horror storyteller. " \
-                       f"Write in a calm, eerie, unsettling tone.\n\n{user_prompt} [/INST]"
-
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "inputs": formatted_prompt,
-        "parameters": {"max_new_tokens": 800, "temperature": 0.8}
-    }
-
-    # --- 3. Retry logic if HF model is still loading ---
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                f"https://api-inference.huggingface.co/models/{HF_MODEL}",
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
-
-            print("HF Status:", response.status_code)
-            print("HF Raw Response:", response.text[:300])  # log first 300 chars
-
-            # Parse response safely
-            try:
-                result = response.json()
-            except Exception:
-                return jsonify({
-                    "status": "error",
-                    "details": "Invalid JSON from Hugging Face",
-                    "raw": response.text
-                }), 200
-
-            # Handle HF API errors
-            if isinstance(result, dict) and "error" in result:
-                if "loading" in result["error"].lower() and attempt < max_retries - 1:
-                    print("⏳ Model still loading... retrying")
-                    time.sleep(10)
-                    continue
-                return jsonify({
-                    "status": "huggingface_error",
-                    "details": result["error"]
-                }), 200
-
-            # Extract generated text
-            story = None
-            if isinstance(result, list) and len(result) > 0:
-                if "generated_text" in result[0]:
-                    story = result[0]["generated_text"]
-
-            if story is None:  # fallback
-                story = result.get("generated_text") if isinstance(result, dict) else str(result)
-
-            return jsonify({
-                "status": "success",
-                "script": story
-            }), 200
-
-        except Exception as e:
-            return jsonify({
-                "status": "error",
-                "details": str(e)
-            }), 200
-
-    # --- 4. Final fallback if all retries fail ---
     return jsonify({
-        "status": "failed",
-        "details": "Model did not respond after retries"
-    }), 200
+        "service": "YouTube horror script generator",
+        "status": "ok",
+        "configured": bool(config.api_key),
+        "model": config.model,
+        "endpoints": {
+            "POST /generate": "generate a horror script from a story idea",
+            "GET /healthz": "liveness and configuration check",
+        },
+    })
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness check. Reports configuration without failing the probe.
+
+    Deploy platforms restart a service whose health check fails, so a missing
+    API key is reported here rather than turned into a non-200 response.
+    """
+    return jsonify({
+        "status": "ok",
+        "configured": bool(config.api_key),
+        "model": config.model,
+        "api_base": config.api_base,
+    })
+
+
+@app.post("/generate")
+def generate():
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify(InvalidRequestError(
+            "Request body must be a JSON object.").to_dict()), 400
+
+    try:
+        brief = ScriptBrief(
+            prompt=data.get("prompt"),
+            tone=data.get("tone"),
+            audience=data.get("audience"),
+            duration_minutes=data.get("duration_minutes"),
+            section_count=data.get("section_count"),
+            temperature=data.get("temperature"),
+        )
+        result = generate_script(brief)
+    except ScriptGenerationError as exc:
+        log.warning("Script generation failed: %s (%s)", exc.message, exc.details)
+        return jsonify(exc.to_dict()), exc.status_code
+
+    log.info("Generated a %d-word script with %d sections.",
+             result["script"]["word_count"], len(result["script"]["sections"]))
+    return jsonify(result), 200
+
+
+@app.errorhandler(404)
+def not_found(_error):
+    return jsonify({"status": "error", "error": "not_found",
+                    "message": "No such endpoint."}), 404
+
+
+@app.errorhandler(405)
+def method_not_allowed(_error):
+    return jsonify({"status": "error", "error": "method_not_allowed",
+                    "message": "That endpoint does not accept this HTTP method."}), 405
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    log.exception("Unhandled error: %s", error)
+    return jsonify({"status": "error", "error": "internal_error",
+                    "message": "Something went wrong generating the script."}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "").lower() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=port, debug=debug)
